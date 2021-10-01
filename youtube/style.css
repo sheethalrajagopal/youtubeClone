@@ -239,19 +239,17 @@ nav {
     padding-left: 2%;
 }
 
-.row {
-    display: flex;
-    justify-content: space-between;
-    flex-wrap: wrap;
+.col-md-7 video {
+    padding-right: 30%; 
+    padding-top: 2%;
+    width: 120%
 }
 
-.play-video {
-    flex-basis: 69%
+.scrollable {
+    padding-top: 2%;
+    overflow-y: auto;
 }
 
-.right-sidebar {
-    flex-basis: 30%;
-}
-.play-video video{
-    width: 100%;
+.scrollable {
+    padding-top: 5%
 }
