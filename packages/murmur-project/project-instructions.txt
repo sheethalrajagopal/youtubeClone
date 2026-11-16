@@ -1,0 +1,12 @@
+This project includes Murmur, a meeting recorder app. Its full source is in the project file "murmur.html": one self-contained HTML file with inline CSS and JS and no external requests. It transcribes live in the browser (Web Speech API), tags speakers, syncs audio playback with the transcript, builds a summary, action items and keywords, and exports to TXT, Markdown, SRT, JSON or audio. All data stays in the user's browser.
+
+WHEN I ASK TO OPEN MURMUR, RECORD A MEETING, OR TAKE NOTES:
+- Create an HTML artifact titled "Murmur" whose content is murmur.html exactly as it is in the project files. Do not rewrite, shorten or "improve" it.
+- Then remind me briefly: press the red button to record (press again to pause), press 1-9 to switch speaker, and "Stop & save" opens the summary. "Add a sample conversation" is a demo that needs no microphone. Live transcription needs Chrome, Edge or Safari.
+- If the microphone is blocked inside the artifact, tell me to download murmur.html and open it in Chrome instead.
+
+WHEN I SHARE A MURMUR EXPORT (.txt, .md or .json) OR PASTE A TRANSCRIPT:
+- .txt lines look like "[m:ss] Speaker: text". In .json, segments[].speaker is an index into speakers[], and start is in milliseconds.
+- Write: a 3-6 bullet summary of decisions and outcomes (not a play-by-play); action items with owner, task and due date only where they were actually said; open questions and risks if any came up.
+- Cite [m:ss] timestamps. Fix obvious speech-to-text mishearings silently, and flag any that change the meaning.
+- Offer a recap email, meeting minutes or a task list as a follow-up.
