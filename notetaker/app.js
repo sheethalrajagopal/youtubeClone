@@ -1,0 +1,1107 @@
+'use strict';
+
+/* =========================================================
+   Murmur: record, transcribe and summarise conversations.
+   Runs fully in the browser: Web Speech API for live
+   transcription, MediaRecorder for audio, IndexedDB storage.
+   ========================================================= */
+
+/* ---------- helpers ---------- */
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const view = $('#view');
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const SPEAKER_COLORS = ['#4f6bed', '#e8590c', '#2f9e44', '#ae3ec9', '#0c8599', '#d6336c', '#b08800', '#5f3dc4'];
+const spkColor = i => SPEAKER_COLORS[i % SPEAKER_COLORS.length];
+
+const pref = {
+  get(k, d) { try { const v = localStorage.getItem('murmur.' + k); return v == null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem('murmur.' + k, JSON.stringify(v)); } catch { /* ignore */ } },
+};
+
+function fmt(ms) {
+  const s = Math.max(0, Math.floor((ms || 0) / 1000));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60;
+  return h ? `${h}:${String(m).padStart(2, '0')}:${String(x).padStart(2, '0')}` : `${m}:${String(x).padStart(2, '0')}`;
+}
+const fmtDate = ts => new Date(ts).toLocaleString(undefined, { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' });
+const initials = name => (name || '').split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0].toUpperCase()).join('') || '?';
+const wordCount = t => (t.match(/\S+/g) || []).length;
+const isTyping = el => el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName));
+
+function tidy(text) {
+  let t = String(text || '').trim().replace(/\s+/g, ' ');
+  if (!t) return '';
+  t = t[0].toUpperCase() + t.slice(1);
+  if (!/[.!?…]$/.test(t)) t += '.';
+  return t;
+}
+
+let toastTimer;
+function toast(msg) {
+  const el = $('#toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2600);
+}
+
+const ICONS = {
+  play: '<polygon points="6 3 20 12 6 21 6 3"/>',
+  pause: '<rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/>',
+  back: '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/>',
+  fwd: '<path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>',
+  download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>',
+  copy: '<rect width="14" height="14" x="8" y="8" rx="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',
+  trash: '<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2"/>',
+  star: '<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>',
+  mic: '<path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/>',
+  search: '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
+  stop: '<rect width="14" height="14" x="5" y="5" rx="2"/>',
+  chevron: '<path d="m6 9 6 6 6-6"/>',
+};
+const icon = (n, extra = '') => `<svg class="i" ${extra} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[n]}</svg>`;
+
+/* ---------- storage (IndexedDB, with in-memory fallback) ---------- */
+const store = {
+  db: null,
+  notes: [],
+  memAudio: new Map(),
+  async init() {
+    try {
+      this.db = await new Promise((res, rej) => {
+        const r = indexedDB.open('murmur', 1);
+        r.onupgradeneeded = () => {
+          r.result.createObjectStore('notes', { keyPath: 'id' });
+          r.result.createObjectStore('audio');
+        };
+        r.onsuccess = () => res(r.result);
+        r.onerror = () => rej(r.error);
+      });
+      this.notes = (await this.req('notes', 'readonly', s => s.getAll())) || [];
+    } catch {
+      this.db = null;
+      toast('Storage is unavailable here, so conversations won\'t be kept after you close the page.');
+    }
+  },
+  req(name, mode, fn) {
+    if (!this.db) return Promise.resolve(undefined);
+    return new Promise((res, rej) => {
+      const tx = this.db.transaction(name, mode);
+      const r = fn(tx.objectStore(name));
+      tx.oncomplete = () => res(r && r.result);
+      tx.onerror = tx.onabort = () => rej(tx.error);
+    });
+  },
+  get(id) { return this.notes.find(n => n.id === id); },
+  async save(note) {
+    note.updatedAt = Date.now();
+    const i = this.notes.findIndex(n => n.id === note.id);
+    if (i < 0) this.notes.push(note); else this.notes[i] = note;
+    renderSidebar();
+    try { await this.req('notes', 'readwrite', s => s.put(note)); } catch { toast('Could not save changes.'); }
+  },
+  async remove(id) {
+    this.notes = this.notes.filter(n => n.id !== id);
+    this.memAudio.delete(id);
+    renderSidebar();
+    await this.req('notes', 'readwrite', s => s.delete(id));
+    await this.req('audio', 'readwrite', s => s.delete(id));
+  },
+  async saveAudio(id, blob) {
+    this.memAudio.set(id, blob);
+    try { await this.req('audio', 'readwrite', s => s.put(blob, id)); } catch { /* memory copy still works */ }
+  },
+  async getAudio(id) {
+    if (this.memAudio.has(id)) return this.memAudio.get(id);
+    try { return await this.req('audio', 'readonly', s => s.get(id)); } catch { return undefined; }
+  },
+};
+
+/* ---------- text analysis (summary, keywords, action items) ---------- */
+const STOP = new Set(`a about above after again against all also am an and any are aren't as at be because been before being below between both but by can can't cannot could couldn't did didn't do does doesn't doing don't down during each even few for from further get gets getting go goes going gonna got had hadn't has hasn't have haven't having he he'd he'll he's her here here's hers herself him himself his how how's i i'd i'll i'm i've if in into is isn't it it's its itself just kind know let's like lot maybe me might more most much must mustn't my myself need no nor not now of off oh ok okay on once one only or other ought our ours ourselves out over own pretty probably quite really right said same say says see shan't she she'd she'll she's should shouldn't so some something sort still such sure than that that's the their theirs them themselves then there there's these they they'd they'll they're they've thing things think this those though through to too um uh under until up us very want wanna was wasn't way we we'd we'll we're we've well were weren't what what's when when's where where's which while who who's whom why why's will with won't would wouldn't yeah yes yet you you'd you'll you're you've your yours yourself yourselves actually basically going thanks thank mean also great good guess bit back yep alright everyone anything everything`.split(/\s+/));
+const tokens = t => (t.toLowerCase().replace(/’/g, "'").match(/[a-z0-9][a-z0-9'-]*/g) || []);
+const content = w => w.length > 2 && !STOP.has(w) && !/^\d+$/.test(w);
+const NOT_ACTION_RE = /\blet'?s (get started|begin|start|kick off|go|see|recap|wrap up|move on|dive in)\b/i;
+const ACTION_RE = /\b(i'll|we'll|you'll|i will|we will|will (send|share|follow|set up|schedule|update|review|write|draft|check|create|look)|need to|needs to|have to|has to|should|must|let's|lets|follow up|follow-up|to-?do|action item|next step|deadline|by (monday|tuesday|wednesday|thursday|friday|tomorrow|next week|end of (day|the week|week|month)|eod|eow))\b/i;
+
+function analyze(note) {
+  const segs = note.segments.filter(s => s.text.trim());
+  const freq = new Map(), bi = new Map();
+  for (const s of segs) {
+    const ws = tokens(s.text);
+    ws.forEach((w, i) => {
+      if (!content(w)) return;
+      freq.set(w, (freq.get(w) || 0) + 1);
+      const nx = ws[i + 1];
+      if (nx && content(nx)) { const k = w + ' ' + nx; bi.set(k, (bi.get(k) || 0) + 1); }
+    });
+  }
+
+  // keywords: repeated phrases first, then frequent words not already covered
+  const phrases = [...bi].filter(([, c]) => c >= 2).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k]) => k);
+  const covered = new Set(phrases.flatMap(p => p.split(' ')));
+  const minCount = segs.length > 8 ? 2 : 1;
+  const words = [...freq].filter(([w, c]) => c >= minCount && !covered.has(w)).sort((a, b) => b[1] - a[1] || b[0].length - a[0].length).map(([w]) => w);
+  const keywords = [...phrases, ...words].slice(0, 12);
+
+  // sentences
+  const sentences = [];
+  for (const s of segs) {
+    for (const t of s.text.split(/(?<=[.!?])\s+/)) {
+      if (t.trim()) sentences.push({ text: t.trim(), start: s.start, segId: s.id, speaker: s.speaker });
+    }
+  }
+
+  // extractive summary: score by frequency of content words
+  const scored = sentences.map((x, i) => {
+    const ws = tokens(x.text);
+    const uniq = [...new Set(ws.filter(content))];
+    const score = uniq.reduce((a, w) => a + (freq.get(w) || 0), 0) / Math.sqrt(Math.max(ws.length, 1));
+    return { ...x, i, score, len: ws.length };
+  }).filter(x => x.len >= 6);
+  const k = Math.min(6, Math.max(2, Math.round(scored.length * 0.2)));
+  const summary = [...scored].sort((a, b) => b.score - a.score).slice(0, k).sort((a, b) => a.i - b.i);
+
+  const seen = new Set();
+  const actions = sentences.filter(x => ACTION_RE.test(x.text) && !NOT_ACTION_RE.test(x.text) && wordCount(x.text) >= 4 && !seen.has(x.text) && seen.add(x.text));
+
+  // talk share by words spoken
+  const talk = note.speakers.map((name, i) => ({ name, i, words: 0 }));
+  for (const s of segs) if (talk[s.speaker]) talk[s.speaker].words += wordCount(s.text);
+  const total = talk.reduce((a, b) => a + b.words, 0) || 1;
+  talk.forEach(t => { t.pct = Math.round((t.words / total) * 100); });
+
+  return { keywords, summary, actions, talk: talk.filter(t => t.words > 0).sort((a, b) => b.words - a.words) };
+}
+
+/* ---------- export ---------- */
+const speakerName = (note, s) => note.speakers[s.speaker] || `Speaker ${s.speaker + 1}`;
+const slug = t => (t || 'conversation').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60) || 'conversation';
+
+function toTxt(note) {
+  return `${note.title}\n${fmtDate(note.createdAt)} · ${fmt(note.duration)}\n\n` +
+    note.segments.map(s => `[${fmt(s.start)}] ${speakerName(note, s)}: ${s.text}`).join('\n\n') + '\n';
+}
+function toMd(note) {
+  const a = analyze(note);
+  let md = `# ${note.title}\n\n_${fmtDate(note.createdAt)} · ${fmt(note.duration)}_\n\n`;
+  if (a.summary.length) md += `## Summary\n\n${a.summary.map(x => `- ${x.text}`).join('\n')}\n\n`;
+  if (a.actions.length) md += `## Action items\n\n${a.actions.map(x => `- [${(note.done || []).includes(x.text) ? 'x' : ' '}] ${x.text}`).join('\n')}\n\n`;
+  if (a.keywords.length) md += `## Keywords\n\n${a.keywords.join(', ')}\n\n`;
+  md += `## Transcript\n\n` + note.segments.map(s => `**${speakerName(note, s)}** \`${fmt(s.start)}\`  \n${s.text}`).join('\n\n') + '\n';
+  return md;
+}
+function toSrt(note) {
+  const t = ms => {
+    const d = new Date(Math.max(0, ms));
+    return `${String(Math.floor(ms / 3600000)).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}:${String(d.getUTCSeconds()).padStart(2, '0')},${String(d.getUTCMilliseconds()).padStart(3, '0')}`;
+  };
+  return note.segments.map((s, i) => {
+    const next = note.segments[i + 1];
+    const end = s.end > s.start ? s.end : (next ? next.start : s.start + 3000);
+    return `${i + 1}\n${t(s.start)} --> ${t(end)}\n${speakerName(note, s)}: ${s.text}\n`;
+  }).join('\n');
+}
+function download(name, data, type) {
+  const blob = data instanceof Blob ? data : new Blob([data], { type });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+
+/* ---------- popover menu ---------- */
+const pop = $('#popover');
+function openPopover(anchor, html, onClick) {
+  pop.innerHTML = html;
+  pop.hidden = false;
+  const r = anchor.getBoundingClientRect();
+  const w = pop.offsetWidth, h = pop.offsetHeight;
+  pop.style.left = Math.max(8, Math.min(r.left, innerWidth - w - 8)) + 'px';
+  pop.style.top = (r.bottom + h + 8 > innerHeight ? Math.max(8, r.top - h - 6) : r.bottom + 6) + 'px';
+  pop.onclick = e => { const b = e.target.closest('button'); if (b) { closePopover(); onClick(b.dataset); } };
+}
+function closePopover() { pop.hidden = true; pop.onclick = null; }
+document.addEventListener('pointerdown', e => { if (!pop.hidden && !pop.contains(e.target)) closePopover(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closePopover(); });
+
+/* ---------- sidebar ---------- */
+function dayGroup(ts) {
+  const d = new Date(ts), now = new Date();
+  const start = x => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const diff = (start(now) - start(d)) / 86400000;
+  if (diff <= 0) return 'Today';
+  if (diff === 1) return 'Yesterday';
+  if (diff < 7) return 'Previous 7 days';
+  return d.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+}
+function highlight(text, q) {
+  if (!q) return esc(text);
+  const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+  let out = '', last = 0;
+  text.replace(re, (m, i) => { out += esc(text.slice(last, i)) + '<mark>' + esc(m) + '</mark>'; last = i + m.length; return m; });
+  return out + esc(text.slice(last));
+}
+function renderSidebar() {
+  const q = $('#globalSearch').value.trim();
+  const ql = q.toLowerCase();
+  const list = $('#noteList');
+  const notes = [...store.notes].sort((a, b) => b.createdAt - a.createdAt);
+  let html = '', group = '', shown = 0;
+  for (const n of notes) {
+    let snippet = n.segments.map(s => s.text).join(' ');
+    if (ql) {
+      const inTitle = n.title.toLowerCase().includes(ql);
+      const idx = snippet.toLowerCase().indexOf(ql);
+      if (!inTitle && idx < 0) continue;
+      if (idx > 40) snippet = '…' + snippet.slice(idx - 30);
+    }
+    const g = dayGroup(n.createdAt);
+    if (g !== group) { html += `<div class="group-label">${esc(g)}</div>`; group = g; }
+    const sel = current.route === 'note' && current.id === n.id ? ' selected' : '';
+    html += `<a class="note-item${sel}" href="#/note/${n.id}">
+      <div class="t">${highlight(n.title, q)}</div>
+      <div class="m">${new Date(n.createdAt).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })} · ${fmt(n.duration)}</div>
+      ${snippet ? `<div class="s">${highlight(snippet.slice(0, 160), q)}</div>` : ''}
+    </a>`;
+    shown++;
+  }
+  if (!shown) html = `<div class="empty-list">${q ? 'No conversations match your search.' : 'No conversations yet. Start a recording to see it here.'}</div>`;
+  list.innerHTML = html;
+}
+$('#globalSearch').addEventListener('input', renderSidebar);
+
+const sidebar = $('#sidebar'), scrim = $('#scrim');
+const closeSidebar = () => { sidebar.classList.remove('open'); scrim.classList.remove('show'); };
+$('#menuBtn').onclick = () => { sidebar.classList.add('open'); scrim.classList.add('show'); };
+scrim.onclick = closeSidebar;
+
+/* ---------- router ---------- */
+let current = { route: 'home' };
+let cleanup = () => {};
+let skipHash = false;
+
+function parseHash() {
+  const [, a, b] = location.hash.replace(/^#/, '').split('/');
+  if (a === 'note' && b) return { route: 'note', id: b };
+  if (a === 'record') return { route: 'record' };
+  return { route: 'home' };
+}
+function route() {
+  cleanup();
+  cleanup = () => {};
+  closePopover();
+  current = parseHash();
+  if (current.route === 'note') {
+    const n = store.get(current.id);
+    if (!n) { location.hash = '#/'; return; }
+    renderNote(n);
+  } else if (current.route === 'record') {
+    renderRecorder();
+  } else {
+    renderHome();
+  }
+  renderSidebar();
+  closeSidebar();
+  view.scrollTop = 0;
+}
+window.addEventListener('hashchange', () => {
+  if (skipHash) { skipHash = false; return; }
+  const next = parseHash();
+  if (rec && rec.started && next.route !== 'record') {
+    if (!confirm('A recording is in progress. Discard it?')) { skipHash = true; location.hash = '#/record'; return; }
+    teardown(rec);
+    rec = null;
+  }
+  route();
+});
+window.addEventListener('beforeunload', e => { if (rec && rec.started) { e.preventDefault(); e.returnValue = ''; } });
+
+/* ---------- home ---------- */
+function renderHome() {
+  const total = store.notes.reduce((a, n) => a + (n.duration || 0), 0);
+  const words = store.notes.reduce((a, n) => a + n.segments.reduce((b, s) => b + wordCount(s.text), 0), 0);
+  view.innerHTML = `
+  <div class="home">
+    <h1>Every conversation, written down.</h1>
+    <p class="lede">Record a meeting, lecture or interview. Murmur transcribes it live with speakers and timestamps, then pulls out a summary, keywords and action items.</p>
+    ${SR ? '' : `<div class="notice"><b>Live transcription isn't supported in this browser.</b> Use Chrome, Edge or Safari for automatic transcripts. You can still record audio and type notes as you go.</div>`}
+    <div class="actions">
+      <a class="btn record-cta" href="#/record"><span class="dot"></span> Start recording</a>
+      <button class="btn" id="homeSample" type="button">Explore a sample conversation</button>
+    </div>
+    <div class="features">
+      <div class="feature"><h3>Live transcript</h3><p>Words appear as people speak. Tag who's talking with one click or the number keys.</p></div>
+      <div class="feature"><h3>Synced playback</h3><p>Click any line to jump to that moment in the audio. The transcript follows along as it plays.</p></div>
+      <div class="feature"><h3>Automatic summary</h3><p>Key points, keywords, action items and each speaker's share of the talking.</p></div>
+      <div class="feature"><h3>Search and export</h3><p>Search every conversation, highlight lines, and export to text, Markdown or SRT subtitles.</p></div>
+    </div>
+    ${store.notes.length ? `<div class="stats">
+      <div><b>${store.notes.length}</b>conversations</div>
+      <div><b>${fmt(total)}</b>recorded</div>
+      <div><b>${words.toLocaleString()}</b>words transcribed</div>
+    </div>` : ''}
+    <p class="meta" style="margin-top:28px">Everything stays in this browser. Shortcuts while recording: <kbd>Space</kbd> pause or resume, <kbd>1</kbd>–<kbd>9</kbd> switch speaker.</p>
+  </div>`;
+  $('#homeSample').onclick = addSample;
+}
+
+/* =========================================================
+   Recorder
+   ========================================================= */
+let rec = null;
+const LANGS = [['en-US', 'English (US)'], ['en-GB', 'English (UK)'], ['en-IN', 'English (India)'], ['en-AU', 'English (Australia)'], ['es-ES', 'Español'], ['fr-FR', 'Français'], ['de-DE', 'Deutsch'], ['it-IT', 'Italiano'], ['pt-BR', 'Português (BR)'], ['hi-IN', 'हिन्दी'], ['ta-IN', 'தமிழ்'], ['te-IN', 'తెలుగు'], ['ja-JP', '日本語'], ['ko-KR', '한국어'], ['zh-CN', '中文 (普通话)']];
+
+function newRec() {
+  const now = new Date();
+  return {
+    started: false, active: false, paused: false,
+    startTime: 0, pausedAccum: 0, pauseStart: 0,
+    chunks: [], segments: [], speakers: ['Speaker 1', 'Speaker 2'], speaker: 0,
+    segStart: null, interim: '', levels: [], createdAt: Date.now(),
+    title: `Meeting · ${now.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}, ${now.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}`,
+    lang: pref.get('lang', LANGS.some(l => l[0] === navigator.language) ? navigator.language : 'en-US'),
+  };
+}
+function elapsed() {
+  if (!rec || !rec.startTime) return 0;
+  const now = rec.paused ? rec.pauseStart : performance.now();
+  return now - rec.startTime - rec.pausedAccum;
+}
+
+function renderRecorder() {
+  if (!rec) rec = newRec();
+  view.innerHTML = `
+  <div class="recorder">
+    <div class="rec-head">
+      <input class="title-input" id="recTitle" value="${esc(rec.title)}" aria-label="Conversation title">
+      <select id="langSel" aria-label="Transcription language" ${SR ? '' : 'disabled'}>
+        ${LANGS.map(([v, l]) => `<option value="${v}"${v === rec.lang ? ' selected' : ''}>${l}</option>`).join('')}
+      </select>
+    </div>
+    <div class="rec-panel">
+      <div class="rec-row">
+        <button class="rec-btn" id="recMain" type="button"></button>
+        <div>
+          <div class="rec-time" id="recTime">0:00</div>
+          <div class="rec-status" id="recStatus"></div>
+        </div>
+        <div class="spacer"></div>
+        <button class="btn ghost" id="recDiscard" type="button">Discard</button>
+        <button class="btn primary" id="recSave" type="button">${icon('stop')} Stop &amp; save</button>
+      </div>
+      <canvas id="wave" aria-hidden="true"></canvas>
+      <div class="speakers-bar" id="spkBar"></div>
+    </div>
+    <div class="live-transcript" id="live"></div>
+    <form class="manual" id="manual">
+      <input id="manualText" placeholder="Type a note and press Enter to add it at the current time" autocomplete="off">
+      <button class="btn" type="submit">Add</button>
+    </form>
+  </div>`;
+
+  $('#recTitle').oninput = e => { rec.title = e.target.value; };
+  $('#langSel').onchange = e => {
+    rec.lang = e.target.value;
+    pref.set('lang', rec.lang);
+    if (rec.active && !rec.paused && SR) { commitInterim(); startRecognition(); }
+  };
+  $('#recMain').onclick = toggleRecording;
+  $('#recSave').onclick = finishRecording;
+  $('#recDiscard').onclick = discardRecording;
+  $('#manual').onsubmit = e => {
+    e.preventDefault();
+    const t = tidy($('#manualText').value);
+    if (!t) return;
+    addSegment(t, elapsed(), elapsed());
+    $('#manualText').value = '';
+  };
+  renderSpeakers();
+  renderLive();
+  updateRecUI();
+  if (rec.active) drawWave(); else drawIdleWave();
+
+  const onKey = e => {
+    if (!rec || isTyping(e.target) || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.code === 'Space') { e.preventDefault(); toggleRecording(); }
+    else if (/^[1-9]$/.test(e.key)) {
+      const i = +e.key - 1;
+      if (i < rec.speakers.length) { setSpeaker(i); }
+      else if (i === rec.speakers.length) { addSpeaker(); }
+    }
+  };
+  document.addEventListener('keydown', onKey);
+  const onResize = () => { if (rec && !rec.active) drawIdleWave(); };
+  window.addEventListener('resize', onResize);
+  cleanup = () => { document.removeEventListener('keydown', onKey); window.removeEventListener('resize', onResize); };
+}
+
+function updateRecUI() {
+  const btn = $('#recMain');
+  if (!btn || !rec) return;
+  const st = $('#recStatus');
+  if (!rec.started) {
+    btn.innerHTML = icon('mic');
+    btn.title = 'Start recording';
+    btn.classList.remove('live');
+    st.textContent = SR ? 'Press the button to start' : 'Audio only: type notes as you go';
+    st.className = 'rec-status';
+  } else if (rec.paused) {
+    btn.innerHTML = icon('mic');
+    btn.title = 'Resume';
+    btn.classList.remove('live');
+    st.textContent = 'Paused';
+    st.className = 'rec-status';
+  } else {
+    btn.innerHTML = icon('pause');
+    btn.title = 'Pause';
+    btn.classList.add('live');
+    st.textContent = rec.note || (SR ? 'Recording and transcribing' : 'Recording audio');
+    st.className = 'rec-status live';
+  }
+  $('#recSave').disabled = !rec.started && !rec.segments.length;
+  $('#recTime').textContent = fmt(elapsed());
+}
+function setStatusNote(msg) { if (rec) { rec.note = msg; updateRecUI(); } }
+
+function renderSpeakers() {
+  const bar = $('#spkBar');
+  if (!bar) return;
+  bar.innerHTML = `<span class="lbl">Speaking now:</span>` + rec.speakers.map((n, i) =>
+    `<button class="chip${i === rec.speaker ? ' on' : ''}" data-i="${i}" type="button" title="Press ${i + 1} · double-click to rename">
+      <span class="avatar" style="background:${spkColor(i)}">${esc(initials(n))}</span>${esc(n)}</button>`).join('') +
+    (rec.speakers.length < 9 ? `<button class="chip add" data-add type="button">+ Add speaker</button>` : '');
+  bar.onclick = e => {
+    const c = e.target.closest('.chip');
+    if (!c) return;
+    if ('add' in c.dataset) addSpeaker(); else setSpeaker(+c.dataset.i);
+  };
+  bar.ondblclick = e => {
+    const c = e.target.closest('.chip[data-i]');
+    if (!c) return;
+    const i = +c.dataset.i;
+    const name = prompt('Rename speaker', rec.speakers[i]);
+    if (name && name.trim()) { rec.speakers[i] = name.trim(); renderSpeakers(); renderLive(); }
+  };
+}
+function setSpeaker(i) {
+  if (i === rec.speaker) return;
+  commitInterim(); // what was said so far belongs to the previous speaker
+  rec.speaker = i;
+  renderSpeakers();
+}
+function addSpeaker() {
+  if (rec.speakers.length >= 9) return;
+  rec.speakers.push(`Speaker ${rec.speakers.length + 1}`);
+  setSpeaker(rec.speakers.length - 1);
+  renderSpeakers();
+}
+
+function segHTML(note, s, prev, opts = {}) {
+  const name = note.speakers[s.speaker] || `Speaker ${s.speaker + 1}`;
+  const cont = prev && prev.speaker === s.speaker && s.start - (prev.end || prev.start) < 30000;
+  const edit = opts.editable ? ' contenteditable="true" spellcheck="true"' : '';
+  return `<div class="seg${cont ? ' cont' : ''}${s.starred ? ' starred' : ''}" data-id="${s.id}" data-start="${s.start}">
+    <div class="seg-side"><span class="avatar" style="background:${spkColor(s.speaker)}">${esc(initials(name))}</span></div>
+    <div class="seg-main">
+      <div class="seg-head">
+        <button class="spk" type="button" data-act="speaker" style="color:${spkColor(s.speaker)}">${esc(name)}</button>
+        <button class="ts" type="button" data-act="seek">${fmt(s.start)}</button>
+        ${opts.editable ? `<button class="star${s.starred ? ' on' : ''}" type="button" data-act="star" title="Highlight">${icon('star')}</button>` : ''}
+      </div>
+      <p class="seg-text"${edit}>${highlight(s.text, opts.query)}</p>
+    </div>
+  </div>`;
+}
+
+function renderLive() {
+  const box = $('#live');
+  if (!box) return;
+  if (!rec.segments.length && !rec.interim) {
+    box.innerHTML = `<div class="live-empty">${rec.started ? 'Listening… start speaking and the transcript will appear here.' : 'Your transcript will appear here as people talk.'}</div><p class="interim" id="interim" hidden></p>`;
+    return;
+  }
+  box.innerHTML = rec.segments.map((s, i) => segHTML(rec, s, rec.segments[i - 1])).join('') + `<p class="interim" id="interim"></p>`;
+  showInterim();
+}
+function showInterim() {
+  const el = $('#interim');
+  if (!el) return;
+  if (rec.interim && $('.live-empty')) { renderLive(); return; }
+  el.hidden = !rec.interim;
+  el.textContent = rec.interim;
+  const box = $('#live');
+  box.scrollTop = box.scrollHeight;
+}
+function addSegment(text, start, end) {
+  rec.segments.push({ id: uid(), start: Math.max(0, Math.round(start)), end: Math.round(end), speaker: rec.speaker, text });
+  renderLive();
+  updateRecUI();
+}
+function commitInterim() {
+  if (!rec) return;
+  const t = tidy(rec.interim);
+  if (t) addSegment(t, rec.segStart ?? elapsed(), elapsed());
+  rec.interim = '';
+  rec.segStart = null;
+  showInterim();
+}
+
+function startRecognition() {
+  if (!SR || !rec) return;
+  if (rec.recog) { const old = rec.recog; rec.recog = null; try { old.abort(); } catch { /* ignore */ } }
+  const r = new SR();
+  r.lang = rec.lang;
+  r.continuous = true;
+  r.interimResults = true;
+  r.maxAlternatives = 1;
+  r.onresult = e => {
+    if (!rec || rec.recog !== r || !rec.active) return;
+    let interim = '';
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const res = e.results[i];
+      const txt = res[0].transcript;
+      if (rec.segStart == null && txt.trim()) rec.segStart = Math.max(0, elapsed() - 700);
+      if (res.isFinal) {
+        const t = tidy(txt);
+        if (t) addSegment(t, rec.segStart ?? elapsed(), elapsed());
+        rec.segStart = null;
+      } else {
+        interim += txt;
+      }
+    }
+    rec.interim = interim;
+    showInterim();
+  };
+  r.onerror = e => {
+    if (!rec || rec.recog !== r) return;
+    if (e.error === 'not-allowed' || e.error === 'service-not-allowed' || e.error === 'language-not-supported') {
+      rec.srBlocked = true;
+      setStatusNote('Recording audio. Live transcription is unavailable, so type notes below.');
+    } else if (e.error === 'network') {
+      rec.srBlocked = true;
+      setStatusNote('Recording audio. The transcription service can\'t be reached.');
+    }
+  };
+  r.onend = () => {
+    // Browsers end recognition after silence; keep it going while recording.
+    if (!rec || rec.recog !== r || !rec.active || rec.paused || rec.srBlocked) return;
+    setTimeout(() => {
+      if (rec && rec.recog === r && rec.active && !rec.paused) { try { r.start(); } catch { /* already running */ } }
+    }, 250);
+  };
+  rec.recog = r;
+  try { r.start(); } catch { /* ignore */ }
+}
+function stopRecognition() {
+  if (!rec || !rec.recog) return;
+  const r = rec.recog;
+  rec.recog = null;
+  try { r.abort(); } catch { /* ignore */ }
+}
+
+async function startRecording() {
+  if (!navigator.mediaDevices?.getUserMedia) { toast('This browser can\'t access a microphone.'); return; }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+  } catch {
+    toast('Microphone access was blocked. Allow it in your browser\'s site settings and try again.');
+    return;
+  }
+  if (!rec) rec = newRec();
+  rec.stream = stream;
+  rec.started = rec.active = true;
+  rec.startTime = performance.now();
+
+  if (window.MediaRecorder) {
+    const mime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus'].find(t => MediaRecorder.isTypeSupported(t));
+    try {
+      rec.mr = new MediaRecorder(stream, mime ? { mimeType: mime } : undefined);
+      rec.mr.ondataavailable = e => { if (e.data.size) rec?.chunks.push(e.data); };
+      rec.mr.start(1000);
+    } catch { rec.mr = null; }
+  }
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    rec.ctx = new AC();
+    rec.an = rec.ctx.createAnalyser();
+    rec.an.fftSize = 1024;
+    rec.ctx.createMediaStreamSource(stream).connect(rec.an);
+  } catch { rec.an = null; }
+
+  startRecognition();
+  rec.timer = setInterval(() => { const t = $('#recTime'); if (t) t.textContent = fmt(elapsed()); }, 250);
+  renderLive();
+  updateRecUI();
+  drawWave();
+}
+function pauseRecording() {
+  commitInterim();
+  rec.paused = true;
+  rec.pauseStart = performance.now();
+  try { if (rec.mr?.state === 'recording') rec.mr.pause(); } catch { /* ignore */ }
+  stopRecognition();
+  updateRecUI();
+}
+function resumeRecording() {
+  rec.pausedAccum += performance.now() - rec.pauseStart;
+  rec.paused = false;
+  try { if (rec.mr?.state === 'paused') rec.mr.resume(); } catch { /* ignore */ }
+  if (!rec.srBlocked) startRecognition();
+  updateRecUI();
+}
+function toggleRecording() {
+  if (!rec || !rec.started) startRecording();
+  else if (rec.paused) resumeRecording();
+  else pauseRecording();
+}
+function teardown(r) {
+  if (!r) return;
+  r.active = false;
+  cancelAnimationFrame(r.raf);
+  clearInterval(r.timer);
+  if (r.recog) { try { r.recog.abort(); } catch { /* ignore */ } r.recog = null; }
+  r.stream?.getTracks().forEach(t => t.stop());
+  try { r.ctx?.close(); } catch { /* ignore */ }
+}
+function discardRecording() {
+  if ((rec.started || rec.segments.length) && !confirm('Discard this recording and its transcript?')) return;
+  teardown(rec);
+  rec = null;
+  location.hash = '#/';
+}
+async function finishRecording() {
+  const r = rec;
+  if (!r || r.saving) return;
+  r.saving = true;
+  if (r.paused) { r.pausedAccum += performance.now() - r.pauseStart; r.paused = false; }
+  commitInterim();
+  const duration = Math.round(elapsed());
+  r.active = false;
+  stopRecognition();
+
+  let blob = null;
+  if (r.mr && r.mr.state !== 'inactive') {
+    blob = await new Promise(res => {
+      r.mr.onstop = () => res(new Blob(r.chunks, { type: r.mr.mimeType || 'audio/webm' }));
+      try { r.mr.stop(); } catch { res(null); }
+    });
+  }
+  teardown(r);
+
+  const lastEnd = r.segments.reduce((a, s) => Math.max(a, s.end || s.start), 0);
+  const note = {
+    id: uid(),
+    title: (r.title || '').trim() || 'Untitled conversation',
+    createdAt: r.createdAt,
+    duration: Math.max(duration, lastEnd),
+    speakers: r.speakers,
+    segments: r.segments,
+    lang: r.lang,
+    hasAudio: !!(blob && blob.size),
+    done: [],
+  };
+  if (note.hasAudio) await store.saveAudio(note.id, blob);
+  await store.save(note);
+  rec = null;
+  location.hash = '#/note/' + note.id;
+  toast('Saved');
+}
+
+/* ---------- waveform ---------- */
+function sizeCanvas(c) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = c.clientWidth, h = c.clientHeight;
+  if (c.width !== w * dpr || c.height !== h * dpr) { c.width = w * dpr; c.height = h * dpr; }
+  const g = c.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { g, w, h };
+}
+function paintBars(c, levels, color) {
+  const { g, w, h } = sizeCanvas(c);
+  g.clearRect(0, 0, w, h);
+  g.fillStyle = color;
+  const step = 5, n = Math.floor(w / step);
+  const data = levels.slice(-n);
+  const off = w - data.length * step;
+  data.forEach((v, i) => {
+    const bh = Math.max(3, Math.min(h, v * h * 3.2));
+    g.globalAlpha = 0.35 + 0.65 * (i / n);
+    g.beginPath();
+    g.roundRect ? g.roundRect(off + i * step, (h - bh) / 2, 3, bh, 1.5) : g.rect(off + i * step, (h - bh) / 2, 3, bh);
+    g.fill();
+  });
+  g.globalAlpha = 1;
+}
+function drawIdleWave() {
+  const c = $('#wave');
+  if (!c) return;
+  const color = getComputedStyle(document.documentElement).getPropertyValue('--border').trim();
+  paintBars(c, new Array(400).fill(0), color);
+}
+function drawWave() {
+  const c = $('#wave');
+  if (!c || !rec || !rec.active) return;
+  if (rec.an) {
+    const buf = new Uint8Array(rec.an.fftSize);
+    rec.an.getByteTimeDomainData(buf);
+    let sum = 0;
+    for (const v of buf) { const x = (v - 128) / 128; sum += x * x; }
+    rec.frame = (rec.frame || 0) + 1;
+    if (rec.frame % 2 === 0) {
+      rec.levels.push(rec.paused ? 0 : Math.sqrt(sum / buf.length));
+      if (rec.levels.length > 600) rec.levels.splice(0, 200);
+    }
+  }
+  const color = getComputedStyle(document.documentElement).getPropertyValue(rec.paused ? '--muted' : '--rec').trim();
+  paintBars(c, rec.levels, color);
+  rec.raf = requestAnimationFrame(drawWave);
+}
+
+/* =========================================================
+   Conversation view
+   ========================================================= */
+function renderNote(note) {
+  const words = note.segments.reduce((a, s) => a + wordCount(s.text), 0);
+  const tab = pref.get('tab', 'transcript');
+  view.innerHTML = `
+  <div class="note">
+    <div class="note-head">
+      <div class="titles">
+        <input class="title-input" id="noteTitle" value="${esc(note.title)}" aria-label="Title">
+        <div class="meta">${fmtDate(note.createdAt)} · ${fmt(note.duration)} · ${words.toLocaleString()} words · ${note.speakers.length} speakers</div>
+      </div>
+      <div class="note-actions">
+        <button class="btn small" id="copyBtn" type="button" title="Copy transcript">${icon('copy')}<span class="lbl">Copy</span></button>
+        <button class="btn small" id="exportBtn" type="button">${icon('download')}<span class="lbl">Export</span>${icon('chevron')}</button>
+        <button class="btn small danger" id="delBtn" type="button" title="Delete">${icon('trash')}<span class="lbl">Delete</span></button>
+      </div>
+    </div>
+    ${note.hasAudio ? `
+    <div class="player" id="player">
+      <button class="icon-btn" data-p="back" type="button" title="Back 15 seconds">${icon('back')}</button>
+      <button class="play" data-p="play" type="button" title="Play (Space)">${icon('play')}</button>
+      <button class="icon-btn" data-p="fwd" type="button" title="Forward 15 seconds">${icon('fwd')}</button>
+      <span class="ptime" id="ptime">0:00 / ${fmt(note.duration)}</span>
+      <input type="range" id="pscrub" min="0" max="${Math.max(1, note.duration)}" step="100" value="0" aria-label="Seek">
+      <select id="pspeed" aria-label="Playback speed">${[0.75, 1, 1.25, 1.5, 1.75, 2].map(v => `<option value="${v}"${v === pref.get('speed', 1) ? ' selected' : ''}>${v}×</option>`).join('')}</select>
+      <audio id="audio" preload="auto"></audio>
+    </div>` : `<div class="no-audio">No audio for this conversation. Timestamps show where each line falls.</div>`}
+    <div class="tabs" id="tabs">
+      <button type="button" data-tab="transcript"${tab === 'transcript' ? ' class="on"' : ''}>Transcript</button>
+      <button type="button" data-tab="summary"${tab === 'summary' ? ' class="on"' : ''}>Summary</button>
+    </div>
+    <div class="note-body" id="noteBody" data-tab="${tab}">
+      <section class="panel transcript-panel">
+        <div class="tools">
+          <label class="search">${icon('search')}<input id="txSearch" type="search" placeholder="Search this transcript" autocomplete="off"></label>
+          <span class="count" id="txCount"></span>
+          ${note.hasAudio ? `<label class="toggle"><input type="checkbox" id="follow"${pref.get('follow', true) ? ' checked' : ''}> Follow playback</label>` : ''}
+        </div>
+        <div id="segments"></div>
+      </section>
+      <aside class="insights" id="insights"></aside>
+    </div>
+  </div>`;
+
+  const save = debounce(() => store.save(note), 400);
+  const refreshInsights = debounce(() => renderInsights(note), 500);
+
+  $('#noteTitle').oninput = e => { note.title = e.target.value.trim() || 'Untitled conversation'; save(); };
+  $('#tabs').onclick = e => {
+    const b = e.target.closest('[data-tab]');
+    if (!b) return;
+    pref.set('tab', b.dataset.tab);
+    $('#noteBody').dataset.tab = b.dataset.tab;
+    $$('#tabs button').forEach(x => x.classList.toggle('on', x === b));
+  };
+  $('#copyBtn').onclick = async () => {
+    try { await navigator.clipboard.writeText(toTxt(note)); toast('Transcript copied'); } catch { toast('Copy failed'); }
+  };
+  $('#exportBtn').onclick = e => openPopover(e.currentTarget, `
+      <button data-f="txt">Text (.txt)</button>
+      <button data-f="md">Markdown with summary (.md)</button>
+      <button data-f="srt">Subtitles (.srt)</button>
+      <button data-f="json">Data (.json)</button>
+      ${note.hasAudio ? '<hr><button data-f="audio">Audio recording</button>' : ''}`,
+    async ({ f }) => {
+      const base = slug(note.title);
+      if (f === 'txt') download(base + '.txt', toTxt(note), 'text/plain');
+      if (f === 'md') download(base + '.md', toMd(note), 'text/markdown');
+      if (f === 'srt') download(base + '.srt', toSrt(note), 'application/x-subrip');
+      if (f === 'json') download(base + '.json', JSON.stringify(note, null, 2), 'application/json');
+      if (f === 'audio') {
+        const blob = await store.getAudio(note.id);
+        if (blob) download(base + (blob.type.includes('mp4') ? '.m4a' : blob.type.includes('ogg') ? '.ogg' : '.webm'), blob);
+        else toast('Audio not found');
+      }
+    });
+  $('#delBtn').onclick = async () => {
+    if (!confirm(`Delete "${note.title}"? This can't be undone.`)) return;
+    await store.remove(note.id);
+    location.hash = '#/';
+    toast('Deleted');
+  };
+
+  /* transcript */
+  let query = '';
+  const segBox = $('#segments');
+  const renderSegments = () => {
+    if (!note.segments.length) { segBox.innerHTML = `<div class="empty-tx">Nothing was transcribed in this conversation.</div>`; return; }
+    segBox.innerHTML = note.segments.map((s, i) => segHTML(note, s, note.segments[i - 1], { editable: true, query })).join('');
+    const n = query ? $$('mark', segBox).length : 0;
+    $('#txCount').textContent = query ? `${n} match${n === 1 ? '' : 'es'}` : '';
+    activeId = null;
+    syncActive(true);
+  };
+  $('#txSearch').oninput = e => { query = e.target.value.trim(); renderSegments(); $('mark', segBox)?.scrollIntoView({ block: 'center' }); };
+
+  segBox.addEventListener('click', e => {
+    const b = e.target.closest('[data-act]');
+    if (!b) return;
+    const el = b.closest('.seg');
+    const seg = note.segments.find(s => s.id === el.dataset.id);
+    if (!seg) return;
+    if (b.dataset.act === 'seek') seek(seg.start, true);
+    if (b.dataset.act === 'star') {
+      seg.starred = !seg.starred;
+      b.classList.toggle('on', seg.starred);
+      el.classList.toggle('starred', seg.starred);
+      save();
+      renderInsights(note);
+    }
+    if (b.dataset.act === 'speaker') {
+      openPopover(b, note.speakers.map((n, i) =>
+        `<button data-i="${i}"><span class="avatar" style="background:${spkColor(i)}">${esc(initials(n))}</span>${esc(n)}${i === seg.speaker ? ' ✓' : ''}</button>`).join('') +
+        `<hr><button data-rename="${seg.speaker}">Rename “${esc(note.speakers[seg.speaker])}”…</button><button data-new>New speaker…</button>`,
+      d => {
+        if (d.i != null) seg.speaker = +d.i;
+        else if (d.rename != null) {
+          const name = prompt('Rename speaker everywhere in this conversation', note.speakers[+d.rename]);
+          if (!name || !name.trim()) return;
+          note.speakers[+d.rename] = name.trim();
+        } else if ('new' in d) {
+          const name = prompt('Name of the new speaker', `Speaker ${note.speakers.length + 1}`);
+          if (!name || !name.trim()) return;
+          note.speakers.push(name.trim());
+          seg.speaker = note.speakers.length - 1;
+        }
+        save();
+        renderSegments();
+        renderInsights(note);
+      });
+    }
+  });
+  segBox.addEventListener('input', e => {
+    const p = e.target.closest('.seg-text');
+    if (!p) return;
+    const seg = note.segments.find(s => s.id === p.closest('.seg').dataset.id);
+    seg.text = p.textContent.replace(/\s+/g, ' ').trim();
+    save();
+    refreshInsights();
+  });
+  segBox.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && e.target.closest('.seg-text')) { e.preventDefault(); e.target.blur(); }
+  });
+  segBox.addEventListener('paste', e => {
+    if (!e.target.closest('.seg-text')) return;
+    e.preventDefault();
+    document.execCommand('insertText', false, e.clipboardData.getData('text/plain'));
+  });
+
+  /* playback */
+  const audio = $('#audio');
+  let url = null, activeId = null;
+  const follow = () => $('#follow')?.checked;
+  const playerTime = () => (audio ? audio.currentTime * 1000 : 0);
+
+  function syncActive(force) {
+    if (!audio) return;
+    const t = playerTime();
+    let cur = null;
+    for (const s of note.segments) { if (s.start <= t + 150) cur = s; else break; }
+    const id = cur && (audio.currentTime > 0 || !audio.paused) ? cur.id : null;
+    if (id === activeId && !force) return;
+    activeId = id;
+    $$('.seg.active', segBox).forEach(x => x.classList.remove('active'));
+    const el = id && segBox.querySelector(`.seg[data-id="${id}"]`);
+    if (el) {
+      el.classList.add('active');
+      if (follow() && !audio.paused && !isTyping(document.activeElement)) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+  }
+  function seek(ms, play) {
+    if (!audio) {
+      const el = segBox.querySelector(`.seg[data-start="${ms}"]`);
+      if (el) { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash'); }
+      return;
+    }
+    audio.currentTime = ms / 1000;
+    if (play) audio.play().catch(() => {});
+    updateTime();
+    syncActive(true);
+    const el = segBox.querySelector(`.seg[data-id="${activeId}"]`);
+    el?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
+  let scrubbing = false;
+  function updateTime() {
+    if (!audio) return;
+    const t = playerTime();
+    $('#ptime').textContent = `${fmt(t)} / ${fmt(note.duration)}`;
+    if (!scrubbing) $('#pscrub').value = t;
+  }
+
+  if (audio) {
+    store.getAudio(note.id).then(blob => {
+      if (!blob || !$('#audio')) { $('#player').outerHTML = `<div class="no-audio">The audio for this conversation couldn't be loaded.</div>`; return; }
+      url = URL.createObjectURL(blob);
+      audio.src = url;
+      audio.playbackRate = pref.get('speed', 1);
+    });
+    const playBtn = $('[data-p="play"]');
+    audio.onplay = () => { playBtn.innerHTML = icon('pause'); };
+    audio.onpause = audio.onended = () => { playBtn.innerHTML = icon('play'); };
+    audio.ontimeupdate = () => { updateTime(); syncActive(); };
+    $('#player').addEventListener('click', e => {
+      const b = e.target.closest('[data-p]');
+      if (!b) return;
+      if (b.dataset.p === 'play') audio.paused ? audio.play().catch(() => {}) : audio.pause();
+      if (b.dataset.p === 'back') seek(Math.max(0, playerTime() - 15000));
+      if (b.dataset.p === 'fwd') seek(Math.min(note.duration, playerTime() + 15000));
+    });
+    const scrub = $('#pscrub');
+    scrub.oninput = () => { scrubbing = true; $('#ptime').textContent = `${fmt(+scrub.value)} / ${fmt(note.duration)}`; };
+    scrub.onchange = () => { scrubbing = false; seek(+scrub.value); };
+    $('#pspeed').onchange = e => { audio.playbackRate = +e.target.value; pref.set('speed', +e.target.value); };
+    $('#follow').onchange = e => pref.set('follow', e.target.checked);
+  }
+
+  const onKey = e => {
+    if (!audio || isTyping(e.target) || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.code === 'Space') { e.preventDefault(); audio.paused ? audio.play().catch(() => {}) : audio.pause(); }
+    if (e.key === 'ArrowLeft') seek(Math.max(0, playerTime() - 5000));
+    if (e.key === 'ArrowRight') seek(Math.min(note.duration, playerTime() + 5000));
+  };
+  document.addEventListener('keydown', onKey);
+
+  // insights panel interactions
+  $('#insights').addEventListener('click', e => {
+    const kw = e.target.closest('.kw');
+    if (kw) {
+      $('#txSearch').value = kw.dataset.kw;
+      $('#txSearch').dispatchEvent(new Event('input'));
+      if ($('#noteBody').dataset.tab === 'summary') $('[data-tab="transcript"]').click();
+      return;
+    }
+    const j = e.target.closest('[data-seek]');
+    if (j && !e.target.matches('input')) {
+      if ($('#noteBody').dataset.tab === 'summary') $('[data-tab="transcript"]').click();
+      seek(+j.dataset.seek, !!audio);
+    }
+  });
+  $('#insights').addEventListener('change', e => {
+    const cb = e.target.closest('input[data-action]');
+    if (!cb) return;
+    const key = cb.dataset.action;
+    note.done = (note.done || []).filter(x => x !== key);
+    if (cb.checked) note.done.push(key);
+    cb.closest('.action').classList.toggle('done', cb.checked);
+    save();
+  });
+
+  renderSegments();
+  renderInsights(note);
+
+  cleanup = () => {
+    document.removeEventListener('keydown', onKey);
+    if (audio) { audio.pause(); audio.removeAttribute('src'); }
+    if (url) URL.revokeObjectURL(url);
+    save.flush();
+  };
+}
+
+function renderInsights(note) {
+  const box = $('#insights');
+  if (!box) return;
+  const a = analyze(note);
+  const done = new Set(note.done || []);
+  const starred = note.segments.filter(s => s.starred);
+  const jump = x => `<li class="jump" data-seek="${x.start}"><small>${fmt(x.start)}</small>${esc(x.text)}</li>`;
+  box.innerHTML = `
+    <section class="card"><h3>Summary</h3>
+      ${a.summary.length ? `<ul>${a.summary.map(jump).join('')}</ul>` : `<p class="muted">A summary appears once there's a bit more conversation.</p>`}
+    </section>
+    <section class="card"><h3>Action items</h3>
+      ${a.actions.length ? `<ul>${a.actions.map(x => `<li class="action${done.has(x.text) ? ' done' : ''}">
+          <input type="checkbox" data-action="${esc(x.text)}"${done.has(x.text) ? ' checked' : ''} aria-label="Mark done">
+          <span class="jump" data-seek="${x.start}"><small>${fmt(x.start)}</small>${esc(x.text)}</span></li>`).join('')}</ul>`
+        : `<p class="muted">No commitments or to-dos detected.</p>`}
+    </section>
+    <section class="card"><h3>Keywords</h3>
+      ${a.keywords.length ? `<div class="chips">${a.keywords.map(k => `<button class="kw" type="button" data-kw="${esc(k)}">${esc(k)}</button>`).join('')}</div>` : `<p class="muted">No keywords yet.</p>`}
+    </section>
+    <section class="card"><h3>Highlights</h3>
+      ${starred.length ? `<ul>${starred.map(jump).join('')}</ul>` : `<p class="muted">Star a line in the transcript to keep it here.</p>`}
+    </section>
+    ${a.talk.length ? `<section class="card"><h3>Speakers</h3><div style="display:grid;gap:10px">
+      ${a.talk.map(t => `<div class="talk"><div class="row"><span>${esc(t.name)}</span><span>${t.pct}% · ${t.words} words</span></div>
+        <div class="bar"><i style="width:${t.pct}%;background:${spkColor(t.i)}"></i></div></div>`).join('')}
+    </div></section>` : ''}`;
+}
+
+function debounce(fn, ms) {
+  let t;
+  const d = (...args) => { clearTimeout(t); t = setTimeout(() => { t = null; fn(...args); }, ms); };
+  d.flush = () => { if (t) { clearTimeout(t); t = null; fn(); } };
+  return d;
+}
+
+/* ---------- sample conversation ---------- */
+async function addSample() {
+  const lines = [
+    [0, 0, "Okay, let's get started. The goal today is to lock the plan for the mobile onboarding launch."],
+    [0, 7, "We have about three weeks, so I want to leave with owners for each piece."],
+    [1, 14, "Sounds good. Quick update from design: the new onboarding screens are finished and the prototype tested well with eight users."],
+    [1, 24, "The biggest drop-off is still the permissions step. People skip notifications when we ask too early."],
+    [2, 33, "That matches the analytics. About forty percent of new users leave on the permissions screen."],
+    [2, 41, "If we move the notification prompt until after the first saved item, I think we recover a big chunk of that."],
+    [0, 50, "Let's do that. Priya, can you update the onboarding flow so the permission prompt comes later?"],
+    [1, 57, "Yes, I'll update the designs and share them with engineering by Wednesday."],
+    [2, 64, "On the engineering side, the onboarding screens are mostly built. The risk is the analytics events, which aren't wired up yet."],
+    [2, 74, "I need to add tracking for each onboarding step so we can measure the drop-off after launch."],
+    [0, 82, "How long does the tracking work take?"],
+    [2, 86, "Two days, maybe three. I will set up the dashboard too so we can watch the launch in real time."],
+    [0, 95, "Great. What about the launch announcement? Marketing asked for the release date."],
+    [1, 102, "We should give them the twenty-fourth as a target, with a beta to internal users a week before."],
+    [0, 110, "Agreed. I'll send the release date to marketing today and schedule the internal beta."],
+    [2, 118, "One more thing: we should keep the old onboarding behind a flag in case we need to roll back."],
+    [0, 126, "Good call. Let's keep the flag for two weeks after launch, then remove it."],
+    [0, 132, "So to recap: Priya updates the permission flow, Sam adds tracking and the dashboard, and I handle the release date and beta. Follow up in Thursday's standup."],
+  ];
+  const now = Date.now();
+  const segments = lines.map(([speaker, sec, text], i) => ({
+    id: uid() + i, speaker, start: sec * 1000,
+    end: (lines[i + 1] ? lines[i + 1][1] : sec + 8) * 1000 - 400, text,
+    starred: i === 5,
+  }));
+  const note = {
+    id: uid(), title: 'Mobile onboarding launch sync (sample)', createdAt: now - 3600 * 1000,
+    duration: 141000, speakers: ['Alex', 'Priya', 'Sam'], segments, lang: 'en-US', hasAudio: false, done: [],
+  };
+  await store.save(note);
+  location.hash = '#/note/' + note.id;
+}
+$('#loadSample').onclick = addSample;
+
+/* ---------- boot ---------- */
+(async function boot() {
+  await store.init();
+  route();
+})();
